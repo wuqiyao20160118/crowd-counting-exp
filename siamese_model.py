@@ -206,8 +206,28 @@ class ResNet(nn.Module):
         fea = self.layer5(x)
         return fea
 
+
+def make_layers(cfg, in_channels=3, batch_norm=False, dilation=False):
+    if dilation:
+        d_rate = 2
+    else:
+        d_rate = 1
+    layers = []
+    for v in cfg:
+        if v == 'M':
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+        else:
+            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=d_rate, dilation=d_rate)
+            if batch_norm:
+                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+            else:
+                layers += [conv2d, nn.ReLU(inplace=True)]
+            in_channels = v
+    return nn.Sequential(*layers)
+
+
 class CoattentionModel(nn.Module):
-    def __init__(self, block, layers, all_channel=256, all_dim=60*60, output_size=471):	 #473./8=60
+    def __init__(self, block, layers, all_channel=256, all_dim=60*60, output_size=473):	 #473./8=60
         super(CoattentionModel, self).__init__()
         self.output_size = output_size
         self.encoder = ResNet(block, layers)
@@ -219,10 +239,12 @@ class CoattentionModel(nn.Module):
         self.conv1 = nn.Conv2d(all_channel*2, all_channel, kernel_size=3, padding=1, bias=False)
         self.conv2 = nn.Conv2d(all_channel*2, all_channel, kernel_size=3, padding=1, bias=False)
         self.prelu = nn.ReLU(inplace=True)
-        self.reg_head1 = nn.Conv2d(all_channel, 128, kernel_size=3)
-        self.reg_head2 = nn.Conv2d(all_channel, 128, kernel_size=3)
-        self.final_conv1 = nn.Conv2d(128, 1, kernel_size=1)
-        self.final_conv2 = nn.Conv2d(128, 1, kernel_size=1)
+        # [512, 512, 512, 256, 128, 64]
+        self.backend_feat = [512, 512, 512, 256, 128, 64]
+        self.backend1 = make_layers(self.backend_feat, in_channels=all_channel, dilation=True)
+        self.backend2 = make_layers(self.backend_feat, in_channels=all_channel, dilation=True)
+        self.final_layer1 = nn.Sequential(nn.Conv2d(64, 1, kernel_size=1), nn.ReLU(inplace=True))
+        self.final_layer2 = nn.Sequential(nn.Conv2d(64, 1, kernel_size=1), nn.ReLU(inplace=True))
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -235,7 +257,7 @@ class CoattentionModel(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
         for k, v in self.encoder.named_parameters():
-            if "layer5" not in k and "layer4" not in k:
+            if "layer5" not in k:
                 v.requires_grad = False
 
     def learnable_parameters(self, lr):
@@ -245,16 +267,16 @@ class CoattentionModel(nn.Module):
             {'params': self.encoder.layer1.parameters(), 'lr': 0},
             {'params': self.encoder.layer2.parameters(), 'lr': 0},
             {'params': self.encoder.layer3.parameters(), 'lr': 0},
-            {'params': self.encoder.layer4.parameters(), 'lr': lr},
+            {'params': self.encoder.layer4.parameters(), 'lr': 0},
             {'params': self.encoder.layer5.parameters(), 'lr': lr},
             {'params': self.linear_e.parameters(), 'lr': lr},
             {'params': self.gate.parameters(), 'lr': lr},
             {'params': self.conv1.parameters(), 'lr': lr},
             {'params': self.conv2.parameters(), 'lr': lr},
-            {'params': self.reg_head1.parameters(), 'lr': 10 * lr},
-            {'params': self.reg_head2.parameters(), 'lr': 10 * lr},
-            {'params': self.final_conv1.parameters(), 'lr': 10 * lr},
-            {'params': self.final_conv2.parameters(), 'lr': 10 * lr}
+            {'params': self.backend1.parameters(), 'lr': 10 * lr},
+            {'params': self.backend2.parameters(), 'lr': 10 * lr},
+            {'params': self.final_layer1.parameters(), 'lr': 10 * lr},
+            {'params': self.final_layer2.parameters(), 'lr': 10 * lr}
         ]
         return parameters
 
@@ -287,14 +309,10 @@ class CoattentionModel(nn.Module):
         input2_att = self.conv2(input2_att)
         input1_att = F.relu(input1_att, inplace=True)
         input2_att = F.relu(input2_att, inplace=True)
-        input1_att = self.reg_head1(input1_att)
-        input2_att = self.reg_head2(input2_att)
-        input1_att = F.relu(input1_att, inplace=True)
-        input2_att = F.relu(input2_att, inplace=True)
-        input1_att = self.final_conv1(input1_att)
-        input2_att = self.final_conv2(input2_att)
-        input1_att = F.relu(input1_att, inplace=True)
-        input2_att = F.relu(input2_att, inplace=True)
+        input1_att = self.backend1(input1_att)
+        input2_att = self.backend2(input2_att)
+        input1_att = self.final_layer1(input1_att)
+        input2_att = self.final_layer2(input2_att)
 
         input1_att = F.interpolate(input1_att, self.output_size, mode='bilinear', align_corners=False)  # upsample to the size of input image, scale=8
         input2_att = F.interpolate(input2_att, self.output_size, mode='bilinear', align_corners=False)
@@ -315,6 +333,9 @@ def CoattentionNet(training=True):
         pretrained_dict = {k[7:]: v for k, v in pretrained_dict.items() if "encoder" in k and "main_classifier" not in k}
         model_dict.update(pretrained_dict)
         model.load_state_dict(model_dict)
+
+        #for k, v in model.named_parameters():
+        #   print(k, v.requires_grad)
     return model
 
 
@@ -327,8 +348,8 @@ def CoattentionNet_flow():
 
 if __name__ == "__main__":
     model = CoattentionNet()
-    model.eval()
-    x = torch.rand([1, 3, 471, 471])
-    y = torch.rand([1, 3, 471, 471])
-    i1, i2 = model(x, y)
-    print(i1.size())
+    #model.eval()
+    #x = torch.rand([1, 3, 473, 473])
+    #y = torch.rand([1, 3, 473, 473])
+    #i1, i2 = model(x, y)
+    #print(i1.size())

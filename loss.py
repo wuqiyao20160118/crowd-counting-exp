@@ -30,8 +30,8 @@ class SiameseCriterion(nn.Module):
     def forward(self, prediction1, prediction2, gt1, gt2, weight):
         basic_loss = self.criterion(prediction1, gt1) + self.criterion(prediction2, gt2)
         additional_loss = self.lmbda * torch.det((torch.mm(weight, torch.transpose(weight, 0, 1).contiguous()) - torch.eye(weight.size(0)).to(self.device)))
-        self.total_loss = basic_loss + additional_loss
-        self.MSEloss.update(self.total_loss * 100, prediction1.size(0))
+        self.total_loss = (basic_loss + additional_loss) * 100
+        self.MSEloss.update(self.total_loss, prediction1.size(0))
         return self.total_loss
 
     def reset(self):
