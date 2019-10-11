@@ -99,7 +99,7 @@ class ASPP(nn.Module):
         self.conv2d_3 = nn.Conv2d(2048, depth, kernel_size=3, stride=1, padding=padding_series[2], dilation=dilation_series[2])
         self.bn_3 = nn.BatchNorm2d(depth)
         self.relu = nn.ReLU(inplace=True)
-        self.bottleneck = nn.Conv2d(depth*5, 256, kernel_size=3, padding=1 )  #512 1x1Conv
+        self.bottleneck = nn.Conv2d(depth*5, 256, kernel_size=3, padding=1)  #512 1x1Conv
         self.bn = nn.BatchNorm2d(256)
         self.prelu = nn.PReLU()
         #for m in self.conv2d_list:
@@ -223,7 +223,7 @@ class CoattentionModel(nn.Module):
         self.reg_head2 = nn.Conv2d(all_channel, 128, kernel_size=3)
         self.final_conv1 = nn.Conv2d(128, 1, kernel_size=1)
         self.final_conv2 = nn.Conv2d(128, 1, kernel_size=1)
-         
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 #n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
@@ -235,7 +235,7 @@ class CoattentionModel(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
         for k, v in self.encoder.named_parameters():
-            if "layer5" not in k:
+            if "layer5" not in k and "layer4" not in k:
                 v.requires_grad = False
 
     def learnable_parameters(self, lr):
@@ -245,7 +245,7 @@ class CoattentionModel(nn.Module):
             {'params': self.encoder.layer1.parameters(), 'lr': 0},
             {'params': self.encoder.layer2.parameters(), 'lr': 0},
             {'params': self.encoder.layer3.parameters(), 'lr': 0},
-            {'params': self.encoder.layer4.parameters(), 'lr': 0},
+            {'params': self.encoder.layer4.parameters(), 'lr': lr},
             {'params': self.encoder.layer5.parameters(), 'lr': lr},
             {'params': self.linear_e.parameters(), 'lr': lr},
             {'params': self.gate.parameters(), 'lr': lr},
@@ -296,8 +296,8 @@ class CoattentionModel(nn.Module):
         input1_att = F.relu(input1_att, inplace=True)
         input2_att = F.relu(input2_att, inplace=True)
 
-        input1_att = F.interpolate(input1_att, self.output_size, mode='bilinear')  # upsample to the size of input image, scale=8
-        input2_att = F.interpolate(input2_att, self.output_size, mode='bilinear')
+        input1_att = F.interpolate(input1_att, self.output_size, mode='bilinear', align_corners=False)  # upsample to the size of input image, scale=8
+        input2_att = F.interpolate(input2_att, self.output_size, mode='bilinear', align_corners=False)
 
         return input1_att, input2_att
     
