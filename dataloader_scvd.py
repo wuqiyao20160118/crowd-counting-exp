@@ -1,248 +1,374 @@
 import numpy as np
 import cv2
 import os
+import torch
+from torch.autograd import Variable
+import pandas as pd
 import random
-from PIL import Image
 from torch.utils.data import Dataset
 from config import config
-import utils
 import time
+import operator
+import utils
 
 random.seed(int(time.time()))
+DOWNSAMPLE = 4
+
+
+def np_to_variable(x, is_training=False, dtype=torch.FloatTensor):
+    if is_training:
+        v = Variable(torch.from_numpy(x).type(dtype))
+    else:
+        with torch.no_grad():
+            v = Variable(torch.from_numpy(x).type(dtype), requires_grad=False)
+    return v
 
 
 class TrainDataLoader(Dataset):
-    def __init__(self, last_transforms, present_transforms, root_dir="./data/scvd/train", training=True):
+    def __init__(self, device, gt_path="./data/scvd_processed/train_den", data_path="./data/scvd_processed/train", training=True, segmentation=False):
         self.max_inter = config.max_inter
-        self.name = root_dir.split('/')[-2]
+        self.name = data_path.split('/')[-2]
         self.ret = {}
-        self.root_dir = root_dir
-        self.sub_class_dir = os.listdir(root_dir)
-        self.last_transforms = last_transforms
-        self.present_transforms = present_transforms
-        self.count = 0
-        self.total = 0
+        self.data_files = []
+        self.folder_num = []
+        self.data_path = data_path
+        self.gt_path = gt_path
         self.training = training
-        all_folders = os.listdir(root_dir)
+        self.device = device
+        self.segmentation = segmentation
+        all_folders = os.listdir(data_path)
+        total = 0
         for single_folder in all_folders:
-            fnames = os.listdir(os.path.join(root_dir, single_folder))
-            self.total += len(fnames) // 2
-            assert isinstance(self.total, int)
+            fnames = os.listdir(os.path.join(data_path, single_folder))
+            fnames.sort()
+            self.folder_num.append(total)
+            total += len(fnames)
+            for fname in fnames:
+                if not operator.eq(fname, 'roi.csv'):
+                    self.data_files.append(os.path.join(os.path.splitext(fname)[0] + '.png'))
+        self.folder_num.append(total)
+        self.shuffle = True if training else False
+        if self.shuffle:
+            random.seed(2468)
+        self.num_samples = len(self.data_files)
 
-    def _pick_img_pairs(self, index_of_subclass):
+    def open(self, fname, flip=False):
+        copy_of_fname = fname
+        split_results_of_fname = copy_of_fname.split('.')
+        possible_folder_name = split_results_of_fname[0]
+        folder_name = possible_folder_name[:-6] + '_screenshot'
 
-        assert index_of_subclass < len(self.sub_class_dir), 'index_of_subclass should less than total classes'
+        img = cv2.imread(os.path.join(self.data_path, folder_name, fname))
+        img = img.astype(np.float32, copy=False)
+        if flip:
+            img = cv2.flip(img, 1)
 
-        video_name = self.sub_class_dir[index_of_subclass]
-        video_dir = os.path.join(self.root_dir, video_name)
-        frame_info = utils.get_frame_annotation(video_dir)
-        video_num = len(frame_info)
-        if self.max_inter >= video_num - 1:
-            self.max_inter = video_num // 2
+        img1, img2, img3 = cv2.split(img)
+        img = img.reshape((3, img.shape[0], img.shape[1]))
+        img[0] = img1
+        img[1] = img2
+        img[2] = img3
 
-        last_index = np.clip(random.choice(range(0, max(1, video_num - self.max_inter))), 0, video_num - 1)
-        present_index = np.clip(random.choice(range(1, max(2, self.max_inter))) + last_index, 0, video_num - 1)
+        den = pd.read_csv(os.path.join(os.path.join(self.gt_path, folder_name), os.path.splitext(fname)[0] + '.csv'),
+                          sep=',', header=None).values
+        den = den.astype(np.float32, copy=False)
+        if flip:
+            den = cv2.flip(den, 1)
+        gt_count = np.sum(den)
+        den = cv2.resize(den, (den.shape[1] // DOWNSAMPLE, den.shape[0] // DOWNSAMPLE))
+        den = den * ((den.shape[1] * DOWNSAMPLE * den.shape[0] * DOWNSAMPLE) / (den.shape[0] * den.shape[1]))
 
-        last_img_path, present_img_path = frame_info[last_index]['img'], frame_info[present_index]['img']
-        last_gt, present_gt = frame_info[last_index]['annotation'], frame_info[present_index]['annotation']
-        ori_last_gt, ori_present_gt = frame_info[last_index]['ori_annotation'], \
-                                      frame_info[present_index]['ori_annotation']
-        self.kernel = utils._gaussian_kernel(sigma=4.0, kernel_size=15)
+        if self.segmentation:
+            den = np.where(den <= 0.001, den, 1)
 
-        # load infomation of template and detection
-        self.ret['last_img_path'] = last_img_path
-        self.ret['present_img_path'] = present_img_path
-        self.last_gt = last_gt
-        self.present_gt = present_gt
-        self.ori_last_gt = ori_last_gt
-        self.ori_present_gt = ori_present_gt
-
-    def _tranform(self):
-        self.ret['train_last_transforms'] = self.last_transforms(self.ret['last_img'])
-        self.ret['train_present_transforms'] = self.present_transforms(self.ret['present_img'])
-
-    def open(self):
-
-        '''template'''
-        #last_img = cv2.imread(self.ret['last_img_path']) #if you use cv2.imread you can not open .JPEG format
-        last_img = Image.open(self.ret['last_img_path'])
-        last_img = np.array(last_img)
-        present_img = Image.open(self.ret['present_img_path'])
-        present_img = np.array(present_img)
-        if np.random.rand(1) < config.gray_ratio:
-            last_img = cv2.cvtColor(last_img, cv2.COLOR_RGB2GRAY)
-            last_img = cv2.cvtColor(last_img, cv2.COLOR_GRAY2RGB)
-            present_img = cv2.cvtColor(present_img, cv2.COLOR_RGB2GRAY)
-            present_img = cv2.cvtColor(present_img, cv2.COLOR_GRAY2RGB)
-
-        if self.training and self.name != "scvd":
-            temp_last, temp_present = np.array([]), np.array([])
-            while temp_last.shape[0] == 0 or temp_present.shape[0] == 0:
-                last_img, present_img, temp_last, temp_present, last_paste_box = \
-                    utils.crop_image(last_img, present_img, self.ori_last_gt, self.ori_present_gt)
-            print("Crop done!")
-            temp_last[:, 0], temp_last[:, 1] = (temp_last[:, 0] + temp_last[:, 1]) / 2, \
-                                               (temp_last[:, 2] + temp_last[:, 3]) / 2
-            temp_present[:, 0], temp_present[:, 1] = (temp_present[:, 0] + temp_present[:, 1]) / 2, \
-                                                     (temp_present[:, 2] + temp_present[:, 3]) / 2
-            self.ret['last_gt'] = temp_last[:, :2]
-            self.ret['present_gt'] = temp_present[:, :2]
-        else:
-            ori_h, ori_w = last_img.shape[0], last_img.shape[1]
-            last_img, present_img = cv2.resize(last_img, (471, 471)), cv2.resize(present_img, (471, 471))
-            scale_h, scale_w = last_img.shape[0] / ori_h, last_img.shape[1] / ori_w
-            self.last_gt[:, 0], self.last_gt[:, 1] = self.last_gt[:, 0] * scale_w, self.last_gt[:, 1] * scale_h
-            self.present_gt[:, 0], self.present_gt[:, 1] = self.present_gt[:, 0] * scale_w, \
-                                                           self.present_gt[:, 1] * scale_h
-            self.ret['last_gt'], self.ret['present_gt'] = self.last_gt, self.present_gt
-
-        self.ret['last_img'] = last_img  # H, W, C
-        self.ret['present_img'] = present_img
-        last_map = utils._create_heatmap(last_img.shape, last_img.shape[0:2], self.ret['last_gt'], self.kernel)
-        present_map = utils._create_heatmap(present_img.shape, present_img.shape[0:2], self.ret['present_gt'], self.kernel)
-        self.ret['last_map'] = np.expand_dims(last_map, axis=0)
-        self.ret['present_map'] = np.expand_dims(present_map, axis=0)
+        den = den.reshape((1, den.shape[0], den.shape[1]))
+        return img, den, gt_count
 
     def __getitem__(self, index):
-        index = random.choice(range(len(self.sub_class_dir)))
+        while (index+1) in self.folder_num or (index+2) in self.folder_num or (index+3) in self.folder_num or (index+4) in self.folder_num:
+            index = int(random.choice(range(0, self.folder_num[-1] - 4)))
+        if random.random() < 0.6:
+            flip = False
+        else:
+            flip = True
+        total_num = np.where(np.array(self.folder_num) > index)[0][0]
+        video_num = self.folder_num[total_num]
+        last_fname = self.data_files[index]
+        last_img, last_den, last_gt_count = self.open(last_fname, flip=flip)
+        last_img = np_to_variable(last_img, is_training=True)
+        last_den = np_to_variable(last_den, is_training=True)
 
-        self._pick_img_pairs(index)
-        self.open()
-        self._tranform()
-        self.count += 1
+        present_index = int(random.choice(range(1, max(2, (video_num - index) // 4)))) * 4 + index
+        present_fname = self.data_files[present_index]
+        present_img, present_den, present_gt_count = self.open(present_fname, flip=flip)
+        present_img = np_to_variable(present_img, is_training=True)
+        present_den = np_to_variable(present_den, is_training=True)
 
-        return self.ret['train_last_transforms'], self.ret['train_present_transforms'], \
-               self.ret['last_map'], self.ret['present_map'], self.ret['last_img_path'], self.ret['present_img_path']
+        return last_img, present_img, last_den, present_den, last_gt_count, present_gt_count, last_fname, present_fname
 
     def __len__(self):
-        return self.total
+        return self.num_samples
 
 
 class ValDataLoader(Dataset):
-    def __init__(self, last_transforms, present_transforms, root_dir="./data/scvd/test", training=False):
+    def __init__(self, device, gt_path="./data/scvd_processed/val_den", data_path="./data/scvd_processed/val", training=False, segmentation=False):
         self.max_inter = config.max_inter
-        self.name = root_dir.split('/')[-2]
+        self.name = data_path.split('/')[-2]
         self.ret = {}
-        self.root_dir = root_dir
-        self.sub_class_dir = os.listdir(root_dir)
-        self.last_transforms = last_transforms
-        self.present_transforms = present_transforms
-        self.count = 0
-        self.total = 0
-        self.video_num = []
+        self.data_files = []
+        self.folder_num = []
+        self.data_path = data_path
+        self.gt_path = gt_path
         self.training = training
-        all_folders = os.listdir(root_dir)
+        self.device = device
+        self.segmentation = segmentation
+        all_folders = os.listdir(data_path)
+        total = 0
         for single_folder in all_folders:
-            fnames = os.listdir(os.path.join(root_dir, single_folder))
-            self.video_num.append(self.total)
-            self.total += len(fnames) // 2 - 1
-            assert isinstance(self.total, int)
+            fnames = os.listdir(os.path.join(data_path, single_folder))
+            fnames.sort()
+            self.folder_num.append(total)
+            total += len(fnames)
+            for fname in fnames:
+                if not operator.eq(fname, 'roi.csv'):
+                    self.data_files.append(os.path.join(os.path.splitext(fname)[0] + '.png'))
+        self.folder_num.append(total)
+        self.shuffle = False
+        if self.shuffle:
+            random.seed(2468)
+        self.num_samples = len(self.data_files)
 
-    def _pick_img_pairs(self, index_of_subclass, idx):
+    def open(self, fname):
+        copy_of_fname = fname
+        split_results_of_fname = copy_of_fname.split('.')
+        possible_folder_name = split_results_of_fname[0]
+        folder_name = possible_folder_name[:-6] + '_screenshot'
 
-        assert index_of_subclass < len(self.sub_class_dir), 'index_of_subclass should less than total classes'
+        img = cv2.imread(os.path.join(self.data_path, folder_name, fname))
+        img = img.astype(np.float32, copy=False)
 
-        video_name = self.sub_class_dir[index_of_subclass]
-        video_dir = os.path.join(self.root_dir, video_name)
-        frame_info = utils.get_frame_annotation(video_dir)
-        video_num = len(frame_info)
-        if self.max_inter >= video_num - 1:
-            self.max_inter = video_num // 2
+        img1, img2, img3 = cv2.split(img)
+        img = img.reshape((3, img.shape[0], img.shape[1]))
+        img[0] = img1
+        img[1] = img2
+        img[2] = img3
 
-        last_index = np.clip(idx, 0, video_num - 1)
-        present_index = np.clip(idx+1, 0, video_num - 1)
+        den = pd.read_csv(os.path.join(os.path.join(self.gt_path, folder_name), os.path.splitext(fname)[0] + '.csv'),
+                          sep=',', header=None).values
+        den = den.astype(np.float32, copy=False)
+        gt_count = np.sum(den)
+        den = cv2.resize(den, (den.shape[1] // DOWNSAMPLE, den.shape[0] // DOWNSAMPLE))
+        den = den * ((den.shape[1] * DOWNSAMPLE * den.shape[0] * DOWNSAMPLE) / (den.shape[0] * den.shape[1]))
 
-        last_img_path, present_img_path = frame_info[last_index]['img'], frame_info[present_index]['img']
-        last_gt, present_gt = frame_info[last_index]['annotation'], frame_info[present_index]['annotation']
-        ori_last_gt, ori_present_gt = frame_info[last_index]['ori_annotation'], \
-                                      frame_info[present_index]['ori_annotation']
-        self.kernel = utils._gaussian_kernel(sigma=4.0, kernel_size=15)
+        if self.segmentation:
+            den = np.where(den <= 0.001, den, 1)
 
-        # load infomation of template and detection
-        self.ret['last_img_path'] = last_img_path
-        self.ret['present_img_path'] = present_img_path
-        self.last_gt = last_gt
-        self.present_gt = present_gt
-        self.ori_last_gt = ori_last_gt
-        self.ori_present_gt = ori_present_gt
-
-    def _tranform(self):
-        self.ret['train_last_transforms'] = self.last_transforms(self.ret['last_img'])
-        self.ret['train_present_transforms'] = self.present_transforms(self.ret['present_img'])
-
-    def open(self):
-
-        '''template'''
-        #last_img = cv2.imread(self.ret['last_img_path']) #if you use cv2.imread you can not open .JPEG format
-        last_img = Image.open(self.ret['last_img_path'])
-        last_img = np.array(last_img)
-        present_img = Image.open(self.ret['present_img_path'])
-        present_img = np.array(present_img)
-        if np.random.rand(1) < config.gray_ratio:
-            last_img = cv2.cvtColor(last_img, cv2.COLOR_RGB2GRAY)
-            last_img = cv2.cvtColor(last_img, cv2.COLOR_GRAY2RGB)
-            present_img = cv2.cvtColor(present_img, cv2.COLOR_RGB2GRAY)
-            present_img = cv2.cvtColor(present_img, cv2.COLOR_GRAY2RGB)
-
-        if self.training and self.name != "scvd":
-            temp_last, temp_present = np.array([]), np.array([])
-            while temp_last.shape[0] == 0 or temp_present.shape[0] == 0:
-                last_img, present_img, temp_last, temp_present, last_paste_box = \
-                    utils.crop_image(last_img, present_img, self.ori_last_gt, self.ori_present_gt)
-            print("Crop done!")
-            temp_last[:, 0], temp_last[:, 1] = (temp_last[:, 0] + temp_last[:, 1]) / 2, \
-                                               (temp_last[:, 2] + temp_last[:, 3]) / 2
-            temp_present[:, 0], temp_present[:, 1] = (temp_present[:, 0] + temp_present[:, 1]) / 2, \
-                                                     (temp_present[:, 2] + temp_present[:, 3]) / 2
-            self.ret['last_gt'] = temp_last[:, :2]
-            self.ret['present_gt'] = temp_present[:, :2]
-        else:
-            ori_h, ori_w = last_img.shape[0], last_img.shape[1]
-            last_img, present_img = cv2.resize(last_img, (471, 471)), cv2.resize(present_img, (471, 471))
-            scale_h, scale_w = last_img.shape[0] / ori_h, last_img.shape[1] / ori_w
-            self.last_gt[:, 0], self.last_gt[:, 1] = self.last_gt[:, 0] * scale_w, self.last_gt[:, 1] * scale_h
-            self.present_gt[:, 0], self.present_gt[:, 1] = self.present_gt[:, 0] * scale_w, \
-                                                           self.present_gt[:, 1] * scale_h
-            self.ret['last_gt'], self.ret['present_gt'] = self.last_gt, self.present_gt
-
-        self.ret['last_img'] = last_img  # H, W, C
-        self.ret['present_img'] = present_img
-        last_map = utils._create_heatmap(last_img.shape, last_img.shape[0:2], self.ret['last_gt'], self.kernel)
-        present_map = utils._create_heatmap(present_img.shape, present_img.shape[0:2], self.ret['present_gt'], self.kernel)
-        self.ret['last_map'] = np.expand_dims(last_map, axis=0)
-        self.ret['present_map'] = np.expand_dims(present_map, axis=0)
+        den = den.reshape((1, den.shape[0], den.shape[1]))
+        return img, den, gt_count
 
     def __getitem__(self, index):
-        idx = 0
-        for i in range(len(self.video_num)):
-            if self.video_num[i] > index:
-                break
-            idx = i
-        total_num = self.video_num[idx]
-        resident = index - total_num
-        self._pick_img_pairs(idx, resident)
-        self.open()
-        self._tranform()
-        self.count += 1
+        if (index+1) in self.folder_num or (index+2) in self.folder_num or (index+3) in self.folder_num or (index+4) in self.folder_num:
+            index -= 4
+        last_fname = self.data_files[index]
+        last_img, last_den, last_gt_count = self.open(last_fname)
+        last_img = np_to_variable(last_img, is_training=False)
+        last_den = np_to_variable(last_den, is_training=False)
 
-        return self.ret['train_last_transforms'], self.ret['train_present_transforms'], \
-               self.ret['last_map'], self.ret['present_map'], self.ret['last_img_path'], self.ret['present_img_path']
+        present_index = index + 4
+        present_fname = self.data_files[present_index]
+        present_img, present_den, present_gt_count = self.open(present_fname)
+        present_img = np_to_variable(present_img, is_training=False)
+        present_den = np_to_variable(present_den, is_training=False)
+
+        return last_img, present_img, last_den, present_den, last_gt_count, present_gt_count, last_fname, present_fname
 
     def __len__(self):
-        return self.total
+        return self.num_samples
+
+
+class TestDataLoader(Dataset):
+    def __init__(self, device, data_path="./data/scvd/test", training=False):
+        self.max_inter = config.max_inter
+        self.name = data_path.split('/')[-2]
+        self.ret = {}
+        self.data_files = []
+        self.folder_num = []
+        self.data_path = data_path
+        self.training = training
+        self.device = device
+        all_folders = os.listdir(data_path)
+        total = 0
+        for single_folder in all_folders:
+            fnames_all = os.listdir(os.path.join(data_path, single_folder))
+            fnames = []
+            for f in fnames_all:
+                if "png" in f:
+                    fnames.append(f)
+            fnames.sort()
+            self.folder_num.append(total)
+            total += len(fnames)
+            for fname in fnames:
+                if not operator.eq(fname, 'roi.csv'):
+                    self.data_files.append(os.path.join(os.path.splitext(fname)[0] + '.png'))
+        self.folder_num.append(total)
+        self.shuffle = False
+        if self.shuffle:
+            random.seed(2468)
+        self.num_samples = len(self.data_files)
+
+    def open(self, fname):
+        copy_of_fname = fname
+        split_results_of_fname = copy_of_fname.split('.')
+        possible_folder_name = split_results_of_fname[0]
+        folder_name = possible_folder_name[:-4] + '_screenshot'
+
+        img = cv2.imread(os.path.join(self.data_path, folder_name, fname))
+        img = img.astype(np.float32, copy=False)
+        ori_shape = img.shape[:2]
+        h, w = ori_shape[0], ori_shape[1]
+        if h < 473 and w < 473:
+            img = cv2.resize(img, (473, 473))
+            h, w = 473, 473
+        elif h < 473:
+            img = cv2.resize(img, (w, 473))
+            h = 473
+        elif w < 473:
+            img = cv2.resize(img, (473, h))
+            w = 473
+
+        #img = cv2.resize(img, (473, 473))
+        img1, img2, img3 = cv2.split(img)
+        img = img.reshape((3, img.shape[0], img.shape[1]))
+        img[0] = img1
+        img[1] = img2
+        img[2] = img3
+
+        annos = utils.get_frame_annotation(os.path.join(self.data_path, folder_name, fname))['annotation']
+        kernel = utils._gaussian_kernel(4.0, 15)
+        den = utils._create_heatmap(ori_shape, (h, w), annos, kernel=kernel)
+        gt_count = np.sum(den)
+        den = den.reshape((1, den.shape[0], den.shape[1]))
+
+        ori_shape = (h, w)
+
+        # compute padding
+        padding_h = 473 - max(h % 473, (h - 473 // 2) % 473)
+        padding_w = 473 - max(w % 473, (w - 473 // 2) % 473)
+
+        # add padding
+        img = np.concatenate((img, np.zeros((img.shape[0], padding_h, img.shape[2]))), axis=1)
+        den = np.concatenate((den, np.zeros((den.shape[0], padding_h, den.shape[2]))), axis=1)
+        img = np.concatenate((img, np.zeros((img.shape[0], img.shape[1], padding_w))), axis=2)
+        den = np.concatenate((den, np.zeros((den.shape[0], den.shape[1], padding_w))), axis=2)
+
+        # create batches
+        imgs, dens = None, None
+        _, h, w = img.shape
+        new_shape = (h, w)
+        disp_height, disp_width = 473 // 2, 473 // 2
+        for i in range(0, h - 473 + 1, disp_height):
+            for j in range(0, w - 473 + 1, disp_width):
+                chunk_img = img[:, i:i + 473, j:j + 473]
+                chunk_den = den[:, i:i + 473, j:j + 473]
+                if imgs is None:
+                    imgs = np.expand_dims(chunk_img, axis=0)
+                else:
+                    imgs = np.concatenate((imgs, np.expand_dims(chunk_img, axis=0)), axis=0)
+                if dens is None:
+                    dens = np.expand_dims(chunk_den, axis=0)
+                else:
+                    dens = np.concatenate((dens, np.expand_dims(chunk_den, axis=0)), axis=0)
+            chunk_img = img[:, i:i + 473, -473:]
+            chunk_den = den[:, i:i + 473, -473:]
+            if imgs is None:
+                imgs = np.expand_dims(chunk_img, axis=0)
+            else:
+                imgs = np.concatenate((imgs, np.expand_dims(chunk_img, axis=0)), axis=0)
+            if dens is None:
+                dens = np.expand_dims(chunk_den, axis=0)
+            else:
+                dens = np.concatenate((dens, np.expand_dims(chunk_den, axis=0)), axis=0)
+        chunk_img = img[:, -473:, -473:]
+        chunk_den = den[:, -473:, -473:]
+        if imgs is None:
+            imgs = np.expand_dims(chunk_img, axis=0)
+        else:
+            imgs = np.concatenate((imgs, np.expand_dims(chunk_img, axis=0)), axis=0)
+        if dens is None:
+            dens = np.expand_dims(chunk_den, axis=0)
+        else:
+            dens = np.concatenate((dens, np.expand_dims(chunk_den, axis=0)), axis=0)
+
+        img, den = imgs, dens
+        return img, den, gt_count, ori_shape, new_shape
+
+    def __getitem__(self, index):
+        last_fname = self.data_files[index]
+        last_img, last_den, last_gt_count, last_ori_shape, last_new_shape = self.open(last_fname)
+        last_img = np_to_variable(last_img, is_training=False)
+        last_den = np_to_variable(last_den, is_training=False)
+
+        if (index + 1) in self.folder_num:
+            present_index = index
+        else:
+            present_index = index + 1
+        present_fname = self.data_files[present_index]
+        present_img, present_den, present_gt_count, present_ori_shape, present_new_shape = self.open(present_fname)
+        present_img = np_to_variable(present_img, is_training=False)
+        present_den = np_to_variable(present_den, is_training=False)
+        assert last_ori_shape == present_ori_shape
+
+        return last_img, present_img, last_den, present_den, last_gt_count, present_gt_count, last_fname, present_fname,\
+               np.array(list(last_ori_shape)), np.array(list(last_new_shape))
+
+    def __len__(self):
+        return self.num_samples
+
+
+def recontruct_test(img_batch, den_batch, orig_shape, new_shape):
+    disp_height, disp_width = 473 // 2, 473 // 2
+    img = np.zeros((3, new_shape[0], new_shape[1]))
+    den = np.zeros(new_shape)
+    cnt = np.zeros(new_shape)
+    ind = 0
+
+    for i in range(0, new_shape[0] - 473 + 1, disp_height):
+        for j in range(0, new_shape[1] - 473 + 1, disp_width):
+            img[:, i:i + 473, j:j + 473] = img_batch[ind, :]
+            den[i:i + 473, j:j + 473] += den_batch[ind, 0]
+            cnt[i:i + 473, j:j + 473] += 1
+            ind += 1
+        img[:, i:i + 473, -473:] = img_batch[ind, :]
+        den[i:i + 473, -473:] += den_batch[ind, 0]
+        cnt[i:i + 473, -473:] += 1
+        ind += 1
+    img[:, -473:, -473:] = img_batch[ind, :]
+    den[-473:, -473:] += den_batch[ind, 0]
+    cnt[-473:, -473:] += 1
+    ind += 1
+    den /= cnt
+    # crop to original shape
+    img = img[:, :orig_shape[0], :orig_shape[1]].reshape((3, orig_shape[0], orig_shape[1]))
+    den = den[:orig_shape[0], :orig_shape[1]].reshape((1, orig_shape[0], orig_shape[1]))
+    return img, den
 
 
 if __name__ == "__main__":
-    from torchvision import transforms
-    from custom_transforms import Normalize, ToTensor
     from torch.utils import data
-    import os.path as osp
-    train_data = TrainDataLoader(transforms.Compose([ToTensor()]), transforms.Compose([ToTensor()]), root_dir="./data/scvd/test")
-    data_loader = data.DataLoader(train_data, batch_size=1)
-    for idx, (_, _, last, present, l_path, p_path) in enumerate(data_loader):
-        last_path = "/".join(l_path[0].split('/')[-1].split('\\')[-2:])
-        print(osp.join("./test", last_path.split('/')[0]))
-        print(last_path.split('/')[-1][:-4])
+    device = torch.device('cpu')
+    test_data = TestDataLoader(device=device)
+    data_loader = data.DataLoader(test_data, batch_size=1, shuffle=False)
+    for idx, (last_img, present_img, last_den, present_den, _, _, last_name, present_name, ori_shape, new_shape) in enumerate(data_loader):
+        print(last_name)
+        print(present_name)
+        print(last_den[0].size())
+        print(ori_shape[0].data.cpu().numpy())
+
+        last_img, last_den = recontruct_test(last_img[0], last_den[0], ori_shape[0].data.cpu().numpy(), new_shape[0].data.cpu().numpy())
+        print(last_img.shape)  # C, H, W
+        last_img = np.transpose(last_img, (1, 2, 0))
+        cv2.imwrite("test.png", img=last_img)
+        print("-----------------------")
         if idx > 1:
             break
 

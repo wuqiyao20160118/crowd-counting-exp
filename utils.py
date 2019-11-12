@@ -158,34 +158,31 @@ def read_xml(in_path):
 
 
 def get_frame_annotation(data_dir, head=True):
-    xml_list = glob(data_dir + '/*.xml')
-    frames = []
-    for xml in xml_list:
-        frame_dict = {}
-        tree = read_xml(xml)
-        root = tree.getroot()
-        temp = []
-        ori_temp = []
-        filename = root.find('filename').text
-        if ".png" not in filename:
-            filename += ".png"
-        img_dir = os.path.join(data_dir, filename)
-        frame_dict['img'] = img_dir
-        for object in root.iter('object'):
-            anno = object.find('bndbox')
-            annotation = [float(anno.find('xmin').text), float(anno.find('xmax').text), \
-                         float(anno.find('ymin').text), float(anno.find('ymax').text)]
-            if head:
-                ori_temp.append(list(deepcopy(annotation)))
-                annotation[0], annotation[1] = (annotation[0] + annotation[1]) / 2, (annotation[2] + annotation[3]) / 2
-                temp.append(list(annotation)[:2])
-            else:
-                ori_temp.append(list(annotation))
-                temp.append(list(annotation))
-        frame_dict['annotation'] = np.array(temp)
-        frame_dict['ori_annotation'] = np.array(ori_temp)
-        frames.append(frame_dict)
-    return frames
+    xml = data_dir[:-4] + '.xml'
+    frame_dict = {}
+    tree = read_xml(xml)
+    root = tree.getroot()
+    temp = []
+    ori_temp = []
+    filename = root.find('filename').text
+    if ".png" not in filename:
+        filename += ".png"
+    img_dir = os.path.join(data_dir, filename)
+    frame_dict['img'] = img_dir
+    for object in root.iter('object'):
+        anno = object.find('bndbox')
+        annotation = [float(anno.find('xmin').text), float(anno.find('xmax').text), \
+                     float(anno.find('ymin').text), float(anno.find('ymax').text)]
+        if head:
+            ori_temp.append(list(deepcopy(annotation)))
+            annotation[0], annotation[1] = (annotation[0] + annotation[1]) / 2, (annotation[2] + annotation[3]) / 2
+            temp.append(list(annotation)[:2])
+        else:
+            ori_temp.append(list(annotation))
+            temp.append(list(annotation))
+    frame_dict['annotation'] = np.array(temp)
+    frame_dict['ori_annotation'] = np.array(ori_temp)
+    return frame_dict
 
 
 def _gaussian_kernel(sigma=1.0, kernel_size=None):
@@ -280,12 +277,14 @@ def round_up(value):
     return round(value + 1e-6 + 1000) - 1000
 
 
-def save_density_map(density_map, output_dir, fname='results.png'):
+def save_density_map(input_img, density_map, output_dir, fname='results.png'):
     if np.max(density_map) > 0:
         density_map = 255*density_map/np.max(density_map)
     if len(density_map.shape) != 2:
         #density_map = density_map[0][0]
         density_map = density_map[0]
+    if density_map.shape[1] != input_img.shape[1]:
+        density_map = cv2.resize(density_map, (input_img.shape[2],input_img.shape[1]))
     cv2.imwrite(os.path.join(output_dir, fname), density_map)
 
 
